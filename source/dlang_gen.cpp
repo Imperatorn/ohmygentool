@@ -124,6 +124,10 @@ std::string merge(std::list<const clang::RecordDecl *> &q)
     return ss.str();
 }
 
+bool isReservedIdentifier(const std::string& id)
+{
+    return std::find(reservedIdentifiers.begin(), reservedIdentifiers.end(), id) != reservedIdentifiers.end();
+}
 
 // De-anonimize provided decl and all sub decls, will set generated identifier to the types
 void deanonimizeTypedef(clang::RecordDecl* decl, const std::string_view optName = std::string_view(), int* count = nullptr)
@@ -332,7 +336,10 @@ bool overridesBaseOf(const FunctionDecl* fn, const CXXRecordDecl* rec)
             return true;
         return std::equal(a->param_begin(), a->param_end(), b->param_begin(), b->param_end(), 
             [](const ParmVarDecl* p1, const ParmVarDecl* p2) {
-                return p1->getType() == p2->getType() || p1->getNameAsString() == p2->getNameAsString();
+                // return true if TYPES does MATCH, OR if their NAMES are EQUAL (but only if present)
+                return p1->getType() == p2->getType() 
+                || (!p1->getName().empty() && !p2->getName().empty() 
+                    && (p1->getName() == p2->getName()));
         });
     };
     if (rec && rec->getDefinition())
@@ -366,26 +373,33 @@ bool overridesBaseOf(const FunctionDecl* fn, const CXXRecordDecl* rec)
     return false;
 }
 
+// In D classes are reference types, 
+// to make it D way it needs one level of indirection stripped.
+// NOTE: type parameter internally is a reference and will be modified
+bool isClassPointer(clang::QualType type)
+{
+    while (type->isPointerType())
+    {
+        type = type->getPointeeType();
+        if (type->isClassType() 
+            && type->isRecordType() 
+            && isPossiblyVirtual(type->getAsRecordDecl()))
+        {
+            return true;
+        }
+    }
+    return false;
+}
 
 clang::QualType adjustForVariable(clang::QualType ty, clang::ASTContext* ctx)
 {
-    bool isVirtual = isPossiblyVirtual(ty->getAsRecordDecl());
-    if (isVirtual)
+    if (ty->isReferenceType() && ctx)
     {
-        // Class in D is reference type, so remove first pointer
-        if (ty->isPointerType() || ty->isReferenceType())
-            return ty->getPointeeType();
-    }
-    else
-    {
-        if (ty->isReferenceType() && ctx)
-        {
-            // Convert non-class refs to pointers
-            // NOTE: this won't affect sizeof attribute,
-            //  in some cases (GNU GCC?) it might differ from actual memory layout
-            auto newtype = ctx->getPointerType(ty->getPointeeType());
-            return newtype;
-        }
+        // Convert non-class refs to pointers
+        // NOTE: this won't affect sizeof attribute,
+        //  in some cases (GNU GCC?) it might differ from actual memory layout
+        auto newtype = ctx->getPointerType(ty->getPointeeType());
+        return newtype;
     }
     return ty;
 }
@@ -445,6 +459,34 @@ std::string getMangledName(const Decl* decl, MangleContext* ctx)
     return ostream.str();
 }
 
+// Chooses wysiwyg string delimiter depending on macro content
+char macroWysiwygDelimiter(const clang::MacroInfo* macro)
+{
+    if (!macro)
+        return '`';
+    
+    auto hasCharacter = [macro] (char delim) -> bool {
+        for (auto tok : macro->tokens())
+        {
+            if (tok.isLiteral())
+            {
+                auto literal = std::string_view(tok.getLiteralData(), tok.getLength());
+                if (literal.find_first_of(delim, 0) != std::string_view::npos)
+                    return true;
+            }
+        }
+        return false;
+    };
+
+    // delimiters to choose from
+    std::string delims = "`$%^#&/";
+
+    auto delim = std::find_if_not(delims.begin(), delims.end(), hasCharacter);
+    if (delim != delims.end())
+        return *delim;
+
+    return '`';
+}
 
 std::string macroToString(const clang::MacroInfo* macro)
 {
@@ -646,7 +688,8 @@ void DlangBindGenerator::finalize()
 void DlangBindGenerator::onMacroDefine(const clang::Token* name, const clang::MacroDirective* macro)
 {
     static const int LONG_MACRO_NUM_TOKENS = 120;
-    auto formatMacroOpen = [] (const clang::MacroInfo* mi, const llvm::StringRef macroName) {
+    char wysiwygDelim = macroWysiwygDelimiter(macro->getMacroInfo());
+    auto formatMacroOpen = [wysiwygDelim] (const clang::MacroInfo* mi, const llvm::StringRef macroName) {
         std::string s;
         llvm::raw_string_ostream os(s);
         os << "enum " << macroName;
@@ -661,14 +704,24 @@ void DlangBindGenerator::onMacroDefine(const clang::Token* name, const clang::Ma
             os << ")";
         os << " = ";
         if (mi->getNumParams() || !isPrimitiveMacro(mi))
-            os << "`";
+        {
+            // write opening for wysiwyg string long form
+            if (wysiwygDelim != '`')
+                os << "q\"";
+            os << wysiwygDelim;
+        }
         return os.str();
     };
-    auto formatMacroClose = [] (const clang::MacroInfo* mi) {
+    auto formatMacroClose = [wysiwygDelim] (const clang::MacroInfo* mi) {
         std::string s;
         llvm::raw_string_ostream os(s);
         if (mi->getNumParams() || !isPrimitiveMacro(mi))
-            os << "`";
+        {
+            os << wysiwygDelim;
+            // write closing for wysiwyg string long form
+            if (wysiwygDelim != '`')
+                os << '"';
+        }
         os << ";";
         return os.str();
     };
@@ -1029,7 +1082,7 @@ void DlangBindGenerator::onFunction(const clang::FunctionDecl *decl)
     // pragma mangle
     if (!fn->isTemplated())
     {
-        if (mangleAll && externStr == "C++")
+        if ((mangleAll && externStr == "C++") || isReservedIdentifier(fn->getName().str()))
         {
             clang::ASTContext& ast = fn->getASTContext();
             std::unique_ptr<MangleContext> mangleCtx = makeManglingContext(&ast);
@@ -1039,11 +1092,13 @@ void DlangBindGenerator::onFunction(const clang::FunctionDecl *decl)
 
     // ret type
     {
-        const auto typeStr = toDStyle(fn->getReturnType());
+        bool shouldStripIndirection = isClassPointer(fn->getReturnType());
+        auto adjustedType = shouldStripIndirection ? fn->getReturnType()->getPointeeType() : fn->getReturnType();
+        const auto typeStr = toDStyle(adjustedType);
         out << typeStr << " ";
     }
     // function name
-    out << fn->getName().str();
+    out << sanitizedIdentifier(fn->getName().str());
 
     if (fn->isTemplated())
     {
@@ -1478,7 +1533,7 @@ std::string DlangBindGenerator::_toDBuiltInType(QualType type)
 
 std::string DlangBindGenerator::sanitizedIdentifier(const std::string &id)
 {
-    if (std::find(reservedIdentifiers.begin(), reservedIdentifiers.end(), id) != reservedIdentifiers.end())
+    if (isReservedIdentifier(id))
         return std::string().append(id).append("_");
     else
         return id;
@@ -1686,7 +1741,9 @@ void DlangBindGenerator::handleFields(const clang::RecordDecl *decl)
             }
         }
 
-        auto fieldTypeStr = toDStyle(adjustForVariable(it->getType(), &decl->getASTContext()));
+        bool shouldStripIndirection = isClassPointer(it->getType());
+        auto adjustedType = shouldStripIndirection ? it->getType()->getPointeeType() : it->getType();
+        auto fieldTypeStr = toDStyle(adjustForVariable(adjustedType, &decl->getASTContext()));
         if (!it->getIdentifier() && !bitfield)
         {
             constexpr const int ANON_PREFIX_LEN = 5;
@@ -1864,6 +1921,8 @@ void DlangBindGenerator::handleMethods(const clang::CXXRecordDecl *decl)
             customMangle = customMangle_;
         }
 
+        if (m->getIdentifier() && isReservedIdentifier(m->getName().str()))
+            customMangle = true;
 
         bool possibleOverride = !(isCtor || isDtor) && (overridesBaseOf(m, decl) || (m->size_overridden_methods() > 0));
         bool cantOverride = possibleOverride && !(m->hasAttr<OverrideAttr>() || m->isVirtual());
@@ -1945,13 +2004,17 @@ void DlangBindGenerator::handleMethods(const clang::CXXRecordDecl *decl)
             out << "@disable ";
         }
 
-        if (hasRetType)
-            out << toDStyle(m->getReturnType()) << " ";
+        if (hasRetType) 
+        {
+            bool shouldStripIndirection = isClassPointer(m->getReturnType());
+            auto adjustedType = shouldStripIndirection ? m->getReturnType()->getPointeeType() : m->getReturnType();
+            out << toDStyle(adjustedType) << " ";
+        }
 
         if (isOperator || m->getIdentifier() == nullptr)
             out << funcName;
         else
-            out << m->getName().str();
+            out << sanitizedIdentifier(m->getName().str());
         
         // runtime args
         out << "(";
@@ -2015,7 +2078,9 @@ void DlangBindGenerator::writeFnRuntimeArgs(const clang::FunctionDecl* fn)
     bool noRefs = inlined && stripRefParam;
     for (const auto fp : fn->parameters())
     {
-        const auto typeStr = toDStyle(fp->getType());
+        bool shouldStripIndirection = isClassPointer(fp->getType());
+        auto adjustedType = shouldStripIndirection ? fp->getType()->getPointeeType() : fp->getType();
+        const auto typeStr = toDStyle(adjustedType);
         if (noRefs)
             out << stripRefFromParam(typeStr);
         else
